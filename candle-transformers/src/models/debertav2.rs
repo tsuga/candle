@@ -15,6 +15,7 @@ pub enum HiddenAct {
     Gelu,
     GeluApproximate,
     Relu,
+    Tanh,
 }
 
 pub struct HiddenActLayer {
@@ -35,6 +36,7 @@ impl HiddenActLayer {
             HiddenAct::Gelu => xs.gelu_erf(),
             HiddenAct::GeluApproximate => xs.gelu(),
             HiddenAct::Relu => xs.relu(),
+            HiddenAct::Tanh => xs.tanh(),
         }
     }
 }
@@ -873,10 +875,10 @@ impl DebertaV2Layer {
 // TODO: In order to fully test ConvLayer a model needs to be found has a configuration where `conv_kernel_size` exists and is > 0
 // https://github.com/huggingface/transformers/blob/78b2929c0554b79e0489b451ce4ece14d265ead2/src/transformers/models/deberta_v2/modeling_deberta_v2.py#L373
 pub struct ConvLayer {
-    _conv_act: String,
-    _conv: Conv1d,
-    _layer_norm: LayerNorm,
-    _dropout: StableDropout,
+    conv_act: HiddenAct,
+    conv: Conv1d,
+    layer_norm: LayerNorm,
+    dropout: StableDropout,
     _config: Config,
 }
 
@@ -885,7 +887,13 @@ impl ConvLayer {
         let config = config.clone();
         let kernel_size = config.conv_kernel_size.unwrap_or(3);
         let groups = config.conv_groups.unwrap_or(1);
-        let conv_act: String = config.conv_act.clone().unwrap_or("tanh".to_string());
+        let conv_act = match config.conv_act.as_deref().unwrap_or("tanh") {
+            "tanh" => HiddenAct::Tanh,
+            "gelu" => HiddenAct::Gelu,
+            "relu" => HiddenAct::Relu,
+            "gelu_approximate" => HiddenAct::GeluApproximate,
+            other => bail!("Unsupported conv_act {other}"),
+        };
 
         let conv_conf = Conv1dConfig {
             padding: (kernel_size - 1) / 2,
@@ -910,21 +918,96 @@ impl ConvLayer {
         let dropout = StableDropout::new(config.hidden_dropout_prob);
 
         Ok(Self {
-            _conv_act: conv_act,
-            _conv: conv,
-            _layer_norm: layer_norm,
-            _dropout: dropout,
+            conv_act,
+            conv,
+            layer_norm,
+            dropout,
             _config: config,
         })
     }
 
     pub fn forward(
         &self,
-        _hidden_states: &Tensor,
-        _residual_states: &Tensor,
-        _input_mask: &Tensor,
+        hidden_states: &Tensor,
+        residual_states: &Tensor,
+        input_mask: &Tensor,
     ) -> Result<Tensor> {
-        todo!("Need a model that contains a conv layer to test against.")
+        let mut out = hidden_states.transpose(1, 2)?;
+        out = self.conv.forward(&out)?;
+        out = out.transpose(1, 2)?;
+        let rmask = Tensor::ones_like(input_mask)?.broadcast_sub(input_mask)?;
+        let mut rmask = rmask.to_dtype(DType::U8)?;
+        rmask = rmask
+            .unsqueeze(2)?
+            .expand(&[out.dim(0)?, out.dim(1)?, out.dim(2)?])?;
+        let zeros = Tensor::zeros_like(&out)?;
+        out = rmask.where_cond(&zeros, &out)?;
+        out = HiddenActLayer::new(self.conv_act).forward(&self.dropout.forward(&out)?)?;
+        let layer_norm_input = residual_states.broadcast_add(&out)?;
+        let output = self.layer_norm.forward(&layer_norm_input)?;
+
+        let mut input_mask = input_mask.clone();
+        if input_mask.dims() != layer_norm_input.dims() {
+            if input_mask.dims().len() == 4 {
+                input_mask = input_mask.squeeze(1)?.squeeze(1)?;
+            }
+            input_mask = input_mask.unsqueeze(2)?;
+        }
+        let input_mask = input_mask.to_dtype(output.dtype())?;
+        output.broadcast_mul(&input_mask)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_nn::{VarBuilder, VarMap};
+
+    #[test]
+    fn conv_layer_forward_shapes() -> Result<()> {
+        let config = Config {
+            vocab_size: 10,
+            hidden_size: 8,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            intermediate_size: 16,
+            hidden_act: HiddenAct::Gelu,
+            hidden_dropout_prob: 0.0,
+            attention_probs_dropout_prob: 0.0,
+            max_position_embeddings: 8,
+            type_vocab_size: 0,
+            initializer_range: 0.02,
+            layer_norm_eps: 1e-5,
+            relative_attention: false,
+            max_relative_positions: -1,
+            pad_token_id: Some(0),
+            position_biased_input: false,
+            pos_att_type: vec![],
+            position_buckets: None,
+            share_att_key: None,
+            attention_head_size: None,
+            embedding_size: None,
+            norm_rel_ebd: None,
+            conv_kernel_size: Some(3),
+            conv_groups: Some(1),
+            conv_act: Some("gelu".to_string()),
+            id2label: None,
+            label2id: None,
+            pooler_dropout: None,
+            pooler_hidden_act: None,
+            pooler_hidden_size: None,
+            cls_dropout: None,
+        };
+        let device = Device::Cpu;
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &device);
+        let layer = ConvLayer::load(vb.pp("conv"), &config)?;
+        let hidden_states = Tensor::randn(0f32, 1.0, (2, 4, config.hidden_size), &device)?;
+        let residual_states = Tensor::zeros((2, 4, config.hidden_size), DType::F32, &device)?;
+        let input_mask = Tensor::ones((2, 4), DType::F32, &device)?;
+        let output = layer.forward(&hidden_states, &residual_states, &input_mask)?;
+        assert_eq!(output.dims(), vec![2, 4, config.hidden_size]);
+        Ok(())
     }
 }
 
