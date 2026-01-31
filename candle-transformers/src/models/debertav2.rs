@@ -935,26 +935,25 @@ impl ConvLayer {
         let mut out = hidden_states.transpose(1, 2)?;
         out = self.conv.forward(&out)?;
         out = out.transpose(1, 2)?;
-        let rmask = Tensor::ones_like(input_mask)?.broadcast_sub(input_mask)?;
-        let mut rmask = rmask.to_dtype(DType::U8)?;
-        rmask = rmask
-            .unsqueeze(2)?
-            .expand(&[out.dim(0)?, out.dim(1)?, out.dim(2)?])?;
+        let inverted_mask = Tensor::ones_like(input_mask)?.broadcast_sub(input_mask)?;
+        let mut inverted_mask = inverted_mask.to_dtype(DType::U8)?;
+        let (d0, d1, d2) = (out.dim(0)?, out.dim(1)?, out.dim(2)?);
+        inverted_mask = inverted_mask.unsqueeze(2)?.expand(&[d0, d1, d2])?;
         let zeros = Tensor::zeros_like(&out)?;
-        out = rmask.where_cond(&zeros, &out)?;
+        out = inverted_mask.where_cond(&zeros, &out)?;
         out = HiddenActLayer::new(self.conv_act).forward(&self.dropout.forward(&out)?)?;
         let layer_norm_input = residual_states.broadcast_add(&out)?;
         let output = self.layer_norm.forward(&layer_norm_input)?;
 
-        let mut input_mask = input_mask.clone();
-        if input_mask.dims() != layer_norm_input.dims() {
-            if input_mask.dims().len() == 4 {
-                input_mask = input_mask.squeeze(1)?.squeeze(1)?;
+        let mut adjusted_mask = input_mask.clone();
+        if adjusted_mask.dims() != layer_norm_input.dims() {
+            if adjusted_mask.dims().len() == 4 {
+                adjusted_mask = adjusted_mask.squeeze(1)?.squeeze(1)?;
             }
-            input_mask = input_mask.unsqueeze(2)?;
+            adjusted_mask = adjusted_mask.unsqueeze(2)?;
         }
-        let input_mask = input_mask.to_dtype(output.dtype())?;
-        output.broadcast_mul(&input_mask)
+        let adjusted_mask = adjusted_mask.to_dtype(output.dtype())?;
+        output.broadcast_mul(&adjusted_mask)
     }
 }
 
