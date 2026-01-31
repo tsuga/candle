@@ -875,7 +875,7 @@ impl DebertaV2Layer {
 // TODO: In order to fully test ConvLayer a model needs to be found has a configuration where `conv_kernel_size` exists and is > 0
 // https://github.com/huggingface/transformers/blob/78b2929c0554b79e0489b451ce4ece14d265ead2/src/transformers/models/deberta_v2/modeling_deberta_v2.py#L373
 pub struct ConvLayer {
-    conv_act: HiddenAct,
+    conv_act_layer: HiddenActLayer,
     conv: Conv1d,
     layer_norm: LayerNorm,
     dropout: StableDropout,
@@ -883,6 +883,20 @@ pub struct ConvLayer {
 }
 
 impl ConvLayer {
+    fn normalize_mask_dims(mask: &Tensor) -> Result<Tensor> {
+        let mut normalized = mask.clone();
+        match normalized.dims().len() {
+            4 => {
+                normalized = normalized.squeeze(1)?.squeeze(1)?;
+            }
+            3 if normalized.dim(1)? == 1 => {
+                normalized = normalized.squeeze(1)?;
+            }
+            _ => {}
+        }
+        Ok(normalized)
+    }
+
     pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
         let config = config.clone();
         let kernel_size = config.conv_kernel_size.unwrap_or(3);
@@ -892,7 +906,9 @@ impl ConvLayer {
             "gelu" => HiddenAct::Gelu,
             "relu" => HiddenAct::Relu,
             "gelu_approximate" => HiddenAct::GeluApproximate,
-            other => bail!("Unsupported conv_act {other}"),
+            other => bail!(
+                "Unsupported conv_act '{other}'. Supported values are: tanh, gelu, relu, gelu_approximate"
+            ),
         };
 
         let conv_conf = Conv1dConfig {
@@ -917,8 +933,9 @@ impl ConvLayer {
 
         let dropout = StableDropout::new(config.hidden_dropout_prob);
 
+        let conv_act_layer = HiddenActLayer::new(conv_act);
         Ok(Self {
-            conv_act,
+            conv_act_layer,
             conv,
             layer_norm,
             dropout,
@@ -932,28 +949,23 @@ impl ConvLayer {
         residual_states: &Tensor,
         input_mask: &Tensor,
     ) -> Result<Tensor> {
+        let normalized_mask = Self::normalize_mask_dims(input_mask)?;
         let mut out = hidden_states.transpose(1, 2)?;
         out = self.conv.forward(&out)?;
         out = out.transpose(1, 2)?;
-        let inverted_mask = Tensor::ones_like(input_mask)?.broadcast_sub(input_mask)?;
-        let mut inverted_mask = inverted_mask.to_dtype(DType::U8)?;
+        let mut inverted_mask = normalized_mask.eq(0f32)?;
         let (d0, d1, d2) = (out.dim(0)?, out.dim(1)?, out.dim(2)?);
         inverted_mask = inverted_mask.unsqueeze(2)?.expand(&[d0, d1, d2])?;
         let zeros = Tensor::zeros_like(&out)?;
         out = inverted_mask.where_cond(&zeros, &out)?;
-        out = HiddenActLayer::new(self.conv_act).forward(&self.dropout.forward(&out)?)?;
+        out = self
+            .conv_act_layer
+            .forward(&self.dropout.forward(&out)?)?;
         let layer_norm_input = residual_states.broadcast_add(&out)?;
         let output = self.layer_norm.forward(&layer_norm_input)?;
 
-        let mut adjusted_mask = input_mask.clone();
-        if adjusted_mask.dims() != layer_norm_input.dims() {
-            if adjusted_mask.dims().len() == 4 {
-                adjusted_mask = adjusted_mask.squeeze(1)?.squeeze(1)?;
-            }
-            adjusted_mask = adjusted_mask.unsqueeze(2)?;
-        }
-        let adjusted_mask = adjusted_mask.to_dtype(output.dtype())?;
-        output.broadcast_mul(&adjusted_mask)
+        let typed_mask = normalized_mask.unsqueeze(2)?.to_dtype(output.dtype())?;
+        output.broadcast_mul(&typed_mask)
     }
 }
 
@@ -961,6 +973,10 @@ impl ConvLayer {
 mod tests {
     use super::*;
     use candle_nn::{VarBuilder, VarMap};
+
+    const BATCH_SIZE: usize = 2;
+    const SEQ_LEN: usize = 4;
+    const ZERO_MASK_OUTPUT_TOLERANCE: f32 = 1e-6;
 
     #[test]
     fn conv_layer_forward_shapes() -> Result<()> {
@@ -1001,11 +1017,26 @@ mod tests {
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &device);
         let layer = ConvLayer::load(vb.pp("conv"), &config)?;
-        let hidden_states = Tensor::randn(0f32, 1.0, (2, 4, config.hidden_size), &device)?;
-        let residual_states = Tensor::zeros((2, 4, config.hidden_size), DType::F32, &device)?;
-        let input_mask = Tensor::ones((2, 4), DType::F32, &device)?;
+        let hidden_states =
+            Tensor::randn(0f32, 1.0, (BATCH_SIZE, SEQ_LEN, config.hidden_size), &device)?;
+        let residual_states =
+            Tensor::zeros((BATCH_SIZE, SEQ_LEN, config.hidden_size), DType::F32, &device)?;
+        let input_mask = Tensor::ones((BATCH_SIZE, SEQ_LEN), DType::F32, &device)?;
         let output = layer.forward(&hidden_states, &residual_states, &input_mask)?;
-        assert_eq!(output.dims(), vec![2, 4, config.hidden_size]);
+        assert_eq!(output.dims(), vec![BATCH_SIZE, SEQ_LEN, config.hidden_size]);
+        let input_mask_4d = Tensor::ones((BATCH_SIZE, 1, 1, SEQ_LEN), DType::F32, &device)?;
+        let output = layer.forward(&hidden_states, &residual_states, &input_mask_4d)?;
+        assert_eq!(output.dims(), vec![BATCH_SIZE, SEQ_LEN, config.hidden_size]);
+        let input_mask_zeros = Tensor::zeros((BATCH_SIZE, SEQ_LEN), DType::F32, &device)?;
+        let output = layer.forward(&hidden_states, &residual_states, &input_mask_zeros)?;
+        let masked_sum = output.abs()?.sum_all()?.to_scalar::<f32>()?;
+        assert!(masked_sum.abs() < ZERO_MASK_OUTPUT_TOLERANCE);
+        let invalid_activation_config = Config {
+            conv_act: Some("invalid_act".to_string()),
+            ..config
+        };
+        let error = ConvLayer::load(vb.pp("invalid_conv"), &invalid_activation_config);
+        assert!(error.is_err());
         Ok(())
     }
 }
