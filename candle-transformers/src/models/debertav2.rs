@@ -60,7 +60,7 @@ pub struct Config {
     pub max_relative_positions: isize,
     pub pad_token_id: Option<usize>,
     pub position_biased_input: bool,
-    #[serde(deserialize_with = "deserialize_pos_att_type")]
+    #[serde(default, deserialize_with = "deserialize_pos_att_type")]
     pub pos_att_type: Vec<String>,
     pub position_buckets: Option<isize>,
     pub share_att_key: Option<bool>,
@@ -975,7 +975,12 @@ impl DebertaV2Encoder {
         // NOTE: The Python code assumes that the config attribute "norm_rel_ebd" is an array of some kind, but most examples have it as a string.
         // So it might need to be updated at some point.
         let norm_rel_ebd = match config.norm_rel_ebd.as_ref() {
-            Some(nre) => nre.trim().to_string(),
+            Some(nre) => nre
+                .split('|')
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join("|"),
             None => "none".to_string(),
         };
 
@@ -1319,13 +1324,8 @@ pub struct DebertaV2ContextPooler {
 // https://github.com/huggingface/transformers/blob/78b2929c0554b79e0489b451ce4ece14d265ead2/src/transformers/models/deberta_v2/modeling_deberta_v2.py#L49
 impl DebertaV2ContextPooler {
     pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        let pooler_hidden_size = config
-            .pooler_hidden_size
-            .context("config.pooler_hidden_size is required for DebertaV2ContextPooler")?;
-
-        let pooler_dropout = config
-            .pooler_dropout
-            .context("config.pooler_dropout is required for DebertaV2ContextPooler")?;
+        let pooler_hidden_size = config.pooler_hidden_size.unwrap_or(config.hidden_size);
+        let pooler_dropout = config.pooler_dropout.unwrap_or(0.0);
 
         let dense = candle_nn::linear(
             pooler_hidden_size,
@@ -1347,16 +1347,16 @@ impl DebertaV2ContextPooler {
         let context_token = self.dropout.forward(&context_token)?;
 
         let pooled_output = self.dense.forward(&context_token.contiguous()?)?;
-        let pooler_hidden_act = self
-            .config
-            .pooler_hidden_act
-            .context("Could not obtain pooler hidden act from config")?;
+        let pooler_hidden_act = self.config.pooler_hidden_act.unwrap_or(HiddenAct::Gelu);
 
         HiddenActLayer::new(pooler_hidden_act).forward(&pooled_output)
     }
 
     pub fn output_dim(&self) -> Result<usize> {
-        self.config.pooler_hidden_size.context("DebertaV2ContextPooler cannot return output_dim (pooler_hidden_size) since it is not specified in the model config")
+        Ok(self
+            .config
+            .pooler_hidden_size
+            .unwrap_or(self.config.hidden_size))
     }
 }
 
