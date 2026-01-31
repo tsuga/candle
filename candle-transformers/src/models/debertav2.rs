@@ -42,6 +42,31 @@ impl HiddenActLayer {
 pub type Id2Label = HashMap<u32, String>;
 pub type Label2Id = HashMap<String, u32>;
 
+/// DeBERTa v3 configs default to GELU for the pooler activation.
+const DEFAULT_POOLER_HIDDEN_ACT: HiddenAct = HiddenAct::Gelu;
+
+impl Config {
+    /// Returns the relative embedding size when relative attention is enabled.
+    pub fn relative_embeddings_size(&self) -> Option<usize> {
+        if !self.relative_attention {
+            return None;
+        }
+
+        let mut max_relative_positions = self.max_relative_positions;
+        if max_relative_positions < 1 {
+            max_relative_positions = self.max_position_embeddings as isize;
+        }
+
+        let position_buckets = self.position_buckets.unwrap_or(-1);
+        let mut pos_ebd_size = max_relative_positions * 2;
+        if position_buckets > 0 {
+            pos_ebd_size = position_buckets * 2;
+        }
+
+        Some(pos_ebd_size as usize)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Config {
     pub vocab_size: usize,
@@ -61,7 +86,7 @@ pub struct Config {
     pub pad_token_id: Option<usize>,
     pub position_biased_input: bool,
     #[serde(default, deserialize_with = "deserialize_pos_att_type")]
-    pub pos_att_type: Vec<String>,
+    pub pos_att_type: Option<Vec<String>>,
     pub position_buckets: Option<isize>,
     pub share_att_key: Option<bool>,
     pub attention_head_size: Option<usize>,
@@ -78,7 +103,9 @@ pub struct Config {
     pub cls_dropout: Option<f64>,
 }
 
-fn deserialize_pos_att_type<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+fn deserialize_pos_att_type<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -89,10 +116,17 @@ where
         Vec(Vec<String>),
     }
 
-    match StringOrVec::deserialize(deserializer)? {
-        StringOrVec::String(s) => Ok(s.split('|').map(String::from).collect()),
-        StringOrVec::Vec(v) => Ok(v),
-    }
+    let value = Option::<StringOrVec>::deserialize(deserializer)?;
+    Ok(value.map(|value| match value {
+        StringOrVec::String(s) => s.split('|').map(String::from).collect(),
+        StringOrVec::Vec(v) => v,
+    }))
+}
+
+/// Returns the configured position attention type list as a slice, defaulting to empty when
+/// DeBERTa v3 configs omit the field.
+fn pos_att_type_slice(config: &Config) -> &[String] {
+    config.pos_att_type.as_deref().unwrap_or(&[])
 }
 
 // NOTE: Dropout is probably not needed for now since this will primarily be used
@@ -370,14 +404,14 @@ impl DebertaV2DisentangledSelfAttention {
             pos_dropout = Some(StableDropout::new(config.hidden_dropout_prob));
 
             if !share_att_key {
-                if config.pos_att_type.iter().any(|s| s == "c2p") {
+                if pos_att_type_slice(&config).iter().any(|s| s == "c2p") {
                     pos_key_proj = Some(candle_nn::linear(
                         config.hidden_size,
                         all_head_size,
                         vb.pp("pos_key_proj"),
                     )?);
                 }
-                if config.pos_att_type.iter().any(|s| s == "p2c") {
+                if pos_att_type_slice(&config).iter().any(|s| s == "p2c") {
                     pos_query_proj = Some(candle_nn::linear(
                         config.hidden_size,
                         all_head_size,
@@ -430,11 +464,11 @@ impl DebertaV2DisentangledSelfAttention {
 
         let mut scale_factor: usize = 1;
 
-        if self.config.pos_att_type.iter().any(|s| s == "c2p") {
+        if pos_att_type_slice(&self.config).iter().any(|s| s == "c2p") {
             scale_factor += 1;
         }
 
-        if self.config.pos_att_type.iter().any(|s| s == "p2c") {
+        if pos_att_type_slice(&self.config).iter().any(|s| s == "p2c") {
             scale_factor += 1;
         }
 
@@ -585,7 +619,7 @@ impl DebertaV2DisentangledSelfAttention {
                     .repeat(repeat_with)?,
             )
         } else {
-            if self.config.pos_att_type.iter().any(|s| s == "c2p") {
+            if pos_att_type_slice(&self.config).iter().any(|s| s == "c2p") {
                 pos_key_layer = Some(
                     self.transpose_for_scores(
                         &self
@@ -599,7 +633,7 @@ impl DebertaV2DisentangledSelfAttention {
                     .repeat(repeat_with)?,
                 )
             }
-            if self.config.pos_att_type.iter().any(|s| s == "p2c") {
+            if pos_att_type_slice(&self.config).iter().any(|s| s == "p2c") {
                 pos_query_layer = Some(self.transpose_for_scores(&self
                     .pos_query_proj
                     .as_ref()
@@ -610,7 +644,7 @@ impl DebertaV2DisentangledSelfAttention {
 
         let mut score = Tensor::new(&[0 as f32], &self.device)?;
 
-        if self.config.pos_att_type.iter().any(|s| s == "c2p") {
+        if pos_att_type_slice(&self.config).iter().any(|s| s == "c2p") {
             let pos_key_layer = pos_key_layer.context("c2p without pos_key_layer")?;
 
             let scale = Tensor::new(
@@ -642,7 +676,7 @@ impl DebertaV2DisentangledSelfAttention {
             )?;
         }
 
-        if self.config.pos_att_type.iter().any(|s| s == "p2c") {
+        if pos_att_type_slice(&self.config).iter().any(|s| s == "p2c") {
             let pos_query_layer = pos_query_layer.context("p2c without pos_key_layer")?;
 
             let scale = Tensor::new(
@@ -950,30 +984,25 @@ impl DebertaV2Encoder {
         let relative_attention = config.relative_attention;
         let mut max_relative_positions = config.max_relative_positions;
 
-        let position_buckets = config.position_buckets.unwrap_or(-1);
-
-        let mut rel_embeddings: Option<Embedding> = None;
-
-        if relative_attention {
-            if max_relative_positions < 1 {
-                max_relative_positions = config.max_position_embeddings as isize;
-            }
-
-            let mut pos_ebd_size = max_relative_positions * 2;
-
-            if position_buckets > 0 {
-                pos_ebd_size = position_buckets * 2;
-            }
-
-            rel_embeddings = Some(embedding(
-                pos_ebd_size as usize,
-                config.hidden_size,
-                vb.pp("rel_embeddings"),
-            )?);
+        if relative_attention && max_relative_positions < 1 {
+            max_relative_positions = config.max_position_embeddings as isize;
         }
 
-        // NOTE: The Python code assumes that the config attribute "norm_rel_ebd" is an array of some kind, but most examples have it as a string.
-        // So it might need to be updated at some point.
+        let position_buckets = config.position_buckets.unwrap_or(-1);
+
+        let rel_embeddings = match config.relative_embeddings_size() {
+            Some(pos_ebd_size) => Some(embedding(
+                pos_ebd_size,
+                config.hidden_size,
+                vb.pp("rel_embeddings"),
+            )?),
+            None => None,
+        };
+
+        // NOTE: Normalize pipe-separated strings (e.g. "layer_norm|other") so the downstream
+        // contains checks (e.g. for "layer_norm") match the python split("|") behavior while
+        // retaining backwards compatibility. Some v3 configs can include extra separators, so
+        // we trim empty entries like leading/trailing or repeated separators once at load time.
         let norm_rel_ebd = match config.norm_rel_ebd.as_ref() {
             Some(nre) => nre
                 .split('|')
@@ -1324,6 +1353,7 @@ pub struct DebertaV2ContextPooler {
 // https://github.com/huggingface/transformers/blob/78b2929c0554b79e0489b451ce4ece14d265ead2/src/transformers/models/deberta_v2/modeling_deberta_v2.py#L49
 impl DebertaV2ContextPooler {
     pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
+        // DeBERTa configs often omit pooler_hidden_size, defaulting to hidden_size.
         let pooler_hidden_size = config.pooler_hidden_size.unwrap_or(config.hidden_size);
         let pooler_dropout = config.pooler_dropout.unwrap_or(0.0);
 
@@ -1347,7 +1377,10 @@ impl DebertaV2ContextPooler {
         let context_token = self.dropout.forward(&context_token)?;
 
         let pooled_output = self.dense.forward(&context_token.contiguous()?)?;
-        let pooler_hidden_act = self.config.pooler_hidden_act.unwrap_or(HiddenAct::Gelu);
+        let pooler_hidden_act = self
+            .config
+            .pooler_hidden_act
+            .unwrap_or(DEFAULT_POOLER_HIDDEN_ACT);
 
         HiddenActLayer::new(pooler_hidden_act).forward(&pooled_output)
     }
